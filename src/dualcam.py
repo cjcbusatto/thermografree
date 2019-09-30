@@ -58,9 +58,9 @@ def ir_capture(image_queue, calibrate, stop, commands, raw_image_queue):
 
         im = (im - min_val) / (max_val - min_val)
 
-    	im[im > 1] = 1
-    	im[im < 0] = 0
-    	im = np.fliplr(im)
+        im[im > 1] = 1
+        im[im < 0] = 0
+        im = np.fliplr(im)
 
         new_image = np.uint8(255 * im)
         image_queue.put(new_image)
@@ -101,29 +101,29 @@ class DualCamera():
 
         self.bias_slider = Scale(self.root, from_=0, to=31, length=400, orient=HORIZONTAL, command=self.bias)
         self.bias_slider.grid(row = 2, column = 1, columnspan=3)
-    	self.bias_label = Label(self.root, text="Bias current")
-    	self.bias_label.grid(row=2, column=0)
+        self.bias_label = Label(self.root, text="Bias current")
+        self.bias_label.grid(row=2, column=0)
 
         self.clock_slider = Scale(self.root, from_=0, to=63, length=400, orient=HORIZONTAL, command=self.clock)
         self.clock_slider.grid(row = 3, column = 1, columnspan=3)
-    	self.clock_label = Label(self.root, text="Clock speed")
-    	self.clock_label.grid(row=3, column=0)
+        self.clock_label = Label(self.root, text="Clock speed")
+        self.clock_label.grid(row=3, column=0)
 
         self.cm_slider = Scale(self.root, from_=0, to=31, length=400, orient=HORIZONTAL, command=self.cm)
         self.cm_slider.grid(row = 4, column = 1, columnspan=3)
-    	self.cm_label = Label(self.root, text="CM current")
-    	self.cm_label.grid(row=4, column=0)
+        self.cm_label = Label(self.root, text="CM current")
+        self.cm_label.grid(row=4, column=0)
 
         # set default positions
-    	self.cm_slider.set(0x0C)
-    	self.clock_slider.set(0x15)
-    	self.bias_slider.set(0x05)
+        self.cm_slider.set(0x0C)
+        self.clock_slider.set(0x15)
+        self.bias_slider.set(0x05)
 
 
         # initialize visible camera
         self.vs = VideoStream(usePiCamera=True).start()
 
-        # thread for reading from sensor hardware intro an image queue           
+        # thread for reading from sensor hardware intro an image queue
         self.ir_images = Queue.LifoQueue()
         self.ir_commands = Queue.Queue()
         self.ir_calibrate = threading.Event()
@@ -168,7 +168,7 @@ class DualCamera():
             ir_image = imutils.resize(ir_frame, height=240, inter=cv2.INTER_LINEAR)
             ir_image = np.dstack((ir_image, ir_image, ir_image))
             ir_image = cv2.LUT(ir_image, colormap).astype('uint8')
-           
+
             self.last_ir_frame = ir_image
             self.image_left = ImageTk.PhotoImage(image=Image.fromarray(ir_image))
             self.image_panel_left.configure(image=self.image_left)

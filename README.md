@@ -17,11 +17,17 @@ The application consists of a Python class for interfacing with the module (`htp
 The Python software has several pre-requisites. To install them on your Raspberry Pi, run the following commands while you have an internet connection.
 
 ```
-$ sudo apt-get install python-pip ipython python-numpy python-scipy libopencv-dev python-opencv python-periphery -y
+$ sudo apt-get install python-pip \
+                       ipython \
+                       python-numpy \
+                       python-scipy \
+                       libopencv-dev \
+                       python-opencv \
+                       -y
 ```
 
 ```
-$ pip install picamera imutils pillow
+$ pip install picamera imutils pillow python-periphery --user
 ```
 
 ### Enable I2C

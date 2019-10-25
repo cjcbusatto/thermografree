@@ -1,186 +1,256 @@
-from periphery import I2C
 import time
-import numpy as np
-import copy
 import struct
+import copy
+
+import numpy as np
+from periphery import I2C
+
+import interpolate
+
+# from defs.h of Table Number 114
+PCSCALEVAL = 1e8
+
+
+# registers
+REG_CONFIG = 0x01
+REG_STATUS = 0x02
+REG_MBIT = 0x03
+REG_BIAS_TOP = 0x04
+REG_BIAS_BOT = 0x05
+REG_CLK = 0x06
+REG_BPA_TOP = 0x07
+REG_BPA_BOT = 0x08
+REG_PU = 0x09
+
+
+# calibration settings read previously from EEPROM
+CAL_MBIT = 0x2C
+CAL_BIAS_TOP = 0x05
+CAL_BIAS_BOT = 0x05
+CAL_CLK = 0x15
+CAL_BPA_TOP = 0x03
+CAL_BPA_BOT = 0x03
+CAL_PU = 0x88
+
+
+def generate_command(register, value):
+    return [I2C.Message([register, value])]
+
+
+def send_command(dev_i2c, address, cmd, wait=True):
+    dev_i2c.transfer(address, cmd)
+    if wait:
+        time.sleep(0.005)
 
 
 class HTPA:
-    def __init__(self, address):
-        self.address = address
+    def __init__(self, address, eeprom_address=0x50, verbose=True):
         self.i2c = I2C("/dev/i2c-1")
+        self.address = address
+        self.eeprom_address = eeprom_address
+        self.verbose = verbose
+        
+        self.mbit = CAL_MBIT
+        self.bias_top = CAL_BIAS_TOP
+        self.bias_bot = CAL_BIAS_BOT
+        self.clk = CAL_CLK
+        self.bpa_top = CAL_BPA_TOP
+        self.bpa_bot = CAL_BPA_BOT
+        self.pull_up = CAL_PU
 
-        wakeup_and_blind = self.generate_command(0x01, 0x01)  # wake up the device
-        adc_res = self.generate_command(0x03, 0x0C)  # set ADC resolution to 16 bits
-        pull_ups = self.generate_command(0x09, 0x88)
-
-        print("Initializing capture settings")
-
-        self.send_command(wakeup_and_blind)
-        self.send_command(adc_res)
-        self.send_command(pull_ups)
-
-        self.set_bias_current(0x05)
-        self.set_clock_speed(0x15)
-        self.set_cm_current(0x0C)
-
-        print("Grabbing EEPROM data")
-
+        self.wake_up_sensor()
+        self.set_calibration_settings()
+        
         eeprom = self.get_eeprom()
         self.extract_eeprom_parameters(eeprom)
-        self.eeprom = eeprom
 
-        # initialize offset to zero
-        self.offset = np.zeros((32, 32))
+        self.update_compensation_parameters()
 
-    def set_bias_current(self, bias):
-        if bias > 31:
-            bias = 31
-        if bias < 0:
-            bias = 0
+    def wake_up_sensor(self):
+        self.write_register(REG_CONFIG, 0x01)
 
-        bias = int(bias)
+    def close(self):
+        self.write_register(REG_CONFIG, 0x00)
 
-        bias_top = self.generate_command(0x04, bias)
-        bias_bottom = self.generate_command(0x05, bias)
+    def write_register(self, register, value):
+        cmd = generate_command(register, value)
+        send_command(self.i2c, self.address, cmd)
 
-        self.send_command(bias_top)
-        self.send_command(bias_bottom)
+    def set_calibration_settings(self):
+        self.write_register(REG_MBIT, self.mbit)
+        self.write_register(REG_BIAS_TOP, self.bias_top)
+        self.write_register(REG_BIAS_BOT, self.bias_bot)
+        self.write_register(REG_CLK, self.clk)
+        self.write_register(REG_BPA_TOP, self.bpa_top)
+        self.write_register(REG_BPA_BOT, self.bpa_bot)
+        self.write_register(REG_PU, self.pull_up)
 
-    def set_clock_speed(self, clk):
-        if clk > 63:
-            clk = 63
-        if clk < 0:
-            clk = 0
+    def ambient_temperature(self, ptats):
+        return self.ptat_grad * np.mean(ptats) + self.ptat_offset
 
-        clk = int(clk)
+    def temperature_compensation(self, im, ptats):
+        compensation = self.th_grad * np.mean(ptats) / (2 ** self.grad_scale)
+        compensation += self.th_offset
 
-        clk_speed = self.generate_command(0x06, clk)
+        return im - compensation
 
-        self.send_command(clk_speed)
+    def electrical_offset_compensation(self, im):
+        return im - self.electrical_offset
 
-    def set_cm_current(self, cm):
-        if cm > 31:
-            cm = 31
-        if cm < 0:
-            cm = 0
+    def sensitivity_compensation(self, im):
+        return PCSCALEVAL * im / self.pix_c
 
-        cm = int(cm)
+    def voltage_compensation(self, im, ptats):
+        PTATAvg = np.mean(ptats)
 
-        cm_top = self.generate_command(0x07, cm)
-        cm_bottom = self.generate_command(0x08, cm)
+        aux1 = self.VddCompGrad * PTATAvg / (2 ** self.VddScGrad) 
+        aux1 = (aux1 + self.VddCompOff) / (2 ** self.VddScOff)
 
-        self.send_command(cm_top)
-        self.send_command(cm_bottom)
+        aux2_1 = self.VddAvg - self.VddTh1
+        aux2_2 = (self.VddTh2 - self.VddTh1)/(self.PTATTh2 - self.PTATTh1)
+        aux2_3 = PTATAvg - self.PTATTh1
+        aux2 = aux2_1 - aux2_2*aux2_3
+        compensation = aux1 * aux2
 
-    def get_eeprom(self, eeprom_address=0x50):
-        # My Raspberry pi keeps timing-out here, so we split it into
-        # two different transfers:...
+        return im - compensation
+
+    def get_eeprom(self):
         q1 = [I2C.Message([0x00, 0x00]), I2C.Message([0x00]*4000, read=True)]
         q2 = [I2C.Message([0x0f, 0xa0]), I2C.Message([0x00]*4000, read=True)]
-        self.i2c.transfer(eeprom_address, q1)
-        self.i2c.transfer(eeprom_address, q2)
+        self.i2c.transfer(self.eeprom_address, q1)
+        self.i2c.transfer(self.eeprom_address, q2)
+
         return np.array(q1[1].data + q2[1].data)
 
-    def extract_eeprom_parameters(self, eeprom):
-        self.VddComp = eeprom[0x0540:0x0740:2] + (eeprom[0x0541:0x0740:2] << 8)
+    def extract_calibration_settings(self, eeprom):
+        mbit = eeprom[0x001A]
+        bias = eeprom[0x001B]
+        clk = eeprom[0x001C]
+        bpa = eeprom[0x001D]
+        pu = eeprom[0x001E]
 
-        ThGrad = eeprom[0x0740:0x0F40:2] + (eeprom[0x0741:0x0F40:2] << 8)
-        ThGrad = [tg - 65536 if tg >= 32768 else tg for tg in ThGrad]
-        ThGrad = np.reshape(ThGrad, (32, 32))
-        ThGrad[16:, :] = np.flipud(ThGrad[16:, :])
-        self.ThGrad = ThGrad
+        if self.verbose:
+            print("Calibration data from eeprom: ")
+            print("MBIT (calib): ", hex(mbit))
+            print("BIAS (calib): ", hex(bias))
+            print("CLK (calib): ", hex(clk))
+            print("BPA (calib): ", hex(bpa))
+            print("PU (calib): ", hex(pu))
 
-        ThOffset = eeprom[0x0F40:0x1740:2] + (eeprom[0x0F41:0x1740:2] << 8)
-        ThOffset = np.reshape(ThOffset, (32, 32))
-        ThOffset[16:, :] = np.flipud(ThOffset[16:, :])
-        self.ThOffset = ThOffset
+    def extract_temperature_compensation_data(self, eeprom):
+        th_grad = eeprom[0x0740:0x0F40:2] + (eeprom[0x0741:0x0F40:2] << 8)
+        th_grad = unsigned_to_signed_array(th_grad)
+        th_grad = np.reshape(th_grad, (32, 32))
+        th_grad[16:,:] = np.flipud(th_grad[16:,:]) # bottom values are flipped
+        self.th_grad = th_grad
+
+        th_offset = eeprom[0x0F40:0x1740:2] + (eeprom[0x0F41:0x1740:2] << 8)
+        th_offset = unsigned_to_signed_array(th_offset)
+        th_offset = np.reshape(th_offset, (32, 32))
+        th_offset[16:,:] = np.flipud(th_offset[16:,:]) # bottom values are flipped
+        self.th_offset = th_offset
+
+        self.grad_scale = eeprom[0x0008]
+        self.ptat_grad = self.eeprom_value_to_float(eeprom[0x0034:0x0038])
+        self.ptat_offset = self.eeprom_value_to_float(eeprom[0x0038:0x003c])
+
+    def extract_sensitivity_compensation_data(self, eeprom):
+        pmin = self.eeprom_value_to_float(eeprom[0x0000:0x0004])
+        pmax = self.eeprom_value_to_float(eeprom[0x0004:0x0008])
+        epsilon = float(eeprom[0x000D])
+        global_gain = eeprom[0x0055] + (eeprom[0x0056] << 8)
 
         P = eeprom[0x1740::2] + (eeprom[0x1741::2] << 8)
         P = np.reshape(P, (32, 32))
-        P[16:, :] = np.flipud(P[16:, :])
-        self.P = P
+        P[16:, :] = np.flipud(P[16:,:])
 
-        epsilon = float(eeprom[0x000D])
-        GlobalGain = eeprom[0x0055] + (eeprom[0x0056] << 8)
-        Pmin = eeprom[0x0000:0x0004]
-        Pmax = eeprom[0x0004:0x0008]
-        Pmin = struct.unpack('f', reduce(lambda a, b: a+b, [chr(p) for p in Pmin]))[0]
-        Pmax = struct.unpack('f', reduce(lambda a, b: a+b, [chr(p) for p in Pmax]))[0]
-        self.PixC = (P * (Pmax - Pmin) / 65535. + Pmin) * (epsilon / 100) * float(GlobalGain) / 100
+        self.pix_c = (P * (pmax - pmin) / 65535. + pmin) * (epsilon / 100) 
+        self.pix_c *= float(global_gain) / 10000
 
-        self.gradScale = eeprom[0x0008]
-        self.VddCalib = eeprom[0x0046] + (eeprom[0x0047] << 8)
-        self.Vdd = 3280.0
-        self.VddScaling = eeprom[0x004E]
+    def extract_voltage_compensation_data(self, eeprom):
+        self.PTATTh1 = eeprom[0x003C] + (eeprom[0x003D] << 8)
+        self.PTATTh2 = eeprom[0x003E] + (eeprom[0x003F] << 8)
+        self.VddTh1 = eeprom[0x0026] + (eeprom[0x0027] << 8)
+        self.VddTh2 = eeprom[0x0028] + (eeprom[0x0029] << 8)
+        self.VddScGrad = eeprom[0x004E]
+        self.VddScOff = eeprom[0x004F]
 
-        PTATgradient = eeprom[0x0034:0x0038]
-        self.PTATgradient = struct.unpack('f', reduce(lambda a, b: a+b, [chr(p) for p in PTATgradient]))[0]
-        PTAToffset = eeprom[0x0038:0x003c]
-        self.PTAToffset = struct.unpack('f', reduce(lambda a, b: a+b, [chr(p) for p in PTAToffset]))[0]
+        if self.verbose:
+            print("Voltage compensation data: ")
+            print("PTATTh1: {}".format(self.PTATTh1))
+            print("PTATTh2: {}".format(self.PTATTh2))
+            print("VddTh1: {}".format(self.VddTh1))
+            print("VddTh2: {}".format(self.VddTh2))
+            print("VddScGrad: {}".format(self.VddScGrad))
+            print("VddScOff: {}".format(self.VddScOff))
 
-    def temperature_compensation(self, im, ptat):
-        comp = np.zeros((32, 32))
+        vdd_comp_grad_ep = eeprom[0x0340:0x0540:2] + (eeprom[0x0341:0x0540:2] << 8)
+        vdd_comp_grad_ep = [v - 65536 if v >= 32768 else v for v in vdd_comp_grad_ep] # check this line. seems ok
+        vdd_comp_grad_ep = np.reshape(vdd_comp_grad_ep, (8, 32))
+        vdd_comp_grad_top_block = vdd_comp_grad_ep[0:4, :]
+        vdd_comp_grad_bot_block = np.flipud(vdd_comp_grad_ep[4:, :])
+        self.VddCompGrad = np.zeros((32, 32))
+        for b in range(0, 4):
+            self.VddCompGrad[4*b : 4*(b+1), :] = vdd_comp_grad_top_block
+            self.VddCompGrad[16 + 4*b : 16 + 4*(b+1), :] = vdd_comp_grad_bot_block
 
-        Ta = np.mean(ptat) * self.PTATgradient + self.PTAToffset
-        ptat_avg = np.mean(ptat)
-        #     temperature compensated voltage
-        comp = ((self.ThGrad * ptat_avg) / pow(2, self.gradScale)) + self.ThOffset
+        vdd_comp_off_ep = eeprom[0x0540:0x0740:2] + (eeprom[0x0541:0x0740:2] << 8)
+        vdd_comp_off_ep = [v - 65536 if v >= 32768 else v for v in vdd_comp_off_ep] # check this line. seems ok
+        vdd_comp_off_ep = np.reshape(vdd_comp_off_ep, (8, 32))
+        vdd_comp_off_top_block = vdd_comp_off_ep[0:4, :]
+        vdd_comp_off_bot_block = np.flipud(vdd_comp_off_ep[4:, :])
+        self.VddCompOff = np.zeros((32, 32))
+        for b in range(0, 4):
+            self.VddCompOff[4*b : 4*(b+1), :] = vdd_comp_off_top_block
+            self.VddCompOff[16 + 4*b : 16 + 4*(b+1), :] = vdd_comp_off_bot_block
 
-        Vcomp = np.reshape(im, (32, 32)) - comp
-        return Vcomp
+    def extract_eeprom_parameters(self, eeprom):
+        self.extract_calibration_settings(eeprom)
+        self.extract_temperature_compensation_data(eeprom)
+        self.extract_sensitivity_compensation_data(eeprom)
+        self.extract_voltage_compensation_data(eeprom)
 
-    def offset_compensation(self, im):
-        return im - self.offset
+    def update_compensation_parameters(self):
+        if self.verbose:
+            print("Updating compensation parameters.")
 
-    def sensitivity_compensation(self, im):
-        return im/self.PixC
+        (offset, vdds) = self.capture_image(blind=True, vdd=True)
+        self.electrical_offset = offset
+        self.VddAvg = np.mean(vdds)
 
-    def measure_observed_offset(self):
-        self.offset = self.read_from_calibration_file()
+    def object_temperature(self, ta, ad):
+        return interpolate.get_temperature(ta, ad)
 
-    def write_calibration_file(self):
-        print("Measuring observed offsets")
-        print("    Camera should be against uniform temperature surface")
-        mean_offset = np.zeros((32, 32))
+    def im_to_temperatures(self, im, ta):
+        temperatures = np.zeros((32,32))
+        for row in range(32):
+            for col in range(32):
+                t = self.object_temperature(ta, im[row, col])/10 - 273
+                temperatures[row, col] = t
 
-        for i in range(10):
-            print("    frame " + str(i))
-            (p, pt) = self.capture_image()
-            im = self.temperature_compensation(p, pt)
-            mean_offset += im/10.0
+        return temperatures
 
-        np.savetxt("calibration.txt", mean_offset, delimiter=",")
-        self.offset = mean_offset
+    def capture_temperatures(self):
+        im, ptats = self.capture_image(blind=False, vdd=False)
+        im = self.temperature_compensation(im, ptats)
+        im = self.electrical_offset_compensation(im)
+        im = self.voltage_compensation(im, ptats)
+        im = self.sensitivity_compensation(im)
 
-    def read_from_calibration_file(self):
-        calibration_file = 'calibration.txt'
-        return np.loadtxt(calibration_file, delimiter=',')
+        ta = self.ambient_temperature(ptats)
+        temps = self.im_to_temperatures(im, ta)
 
-    def measure_electrical_offset(self):
-        (offsets, ptats) = self.capture_image(blind=True)
-        self.offset = self.temperature_compensation(offsets, ptats)
+        return temps, ta
 
-    def capture_image(self, blind=False):
+    def capture_image(self, blind=False, vdd=False):
         pixel_values = np.zeros(1024)
         ptats = np.zeros(8)
 
         for block in range(4):
-            # print("Exposing block " + str(block))
-            self.send_command(self.generate_expose_block_command(block, blind=blind), wait=False)
+            self.expose_block(block, blind=blind, vdd=vdd)
 
-            query = [I2C.Message([0x02]), I2C.Message([0x00], read=True)]
-            expected = 1 + (block << 4)
-
-            done = False
-
-            while not done:
-                self.i2c.transfer(self.address, query)
-
-                if not (query[1].data[0] == expected):
-                    time.sleep(0.005)
-                else:
-                    done = True
+            while not self.block_capture_finished(block, blind, vdd):
+                time.sleep(0.005)
 
             read_block = [I2C.Message([0x0A]), I2C.Message([0x00]*258, read=True)]
             self.i2c.transfer(self.address, read_block)
@@ -194,7 +264,6 @@ class HTPA:
             bottom_data = bottom_data[1::2] + (bottom_data[0::2] << 8)
 
             pixel_values[(0+block*128):(128+block*128)] = top_data[1:]
-
             # bottom data is in a weird shape
             pixel_values[(992-block*128):(1024-block*128)] = bottom_data[1:33]
             pixel_values[(960-block*128):(992-block*128)] = bottom_data[33:65]
@@ -205,23 +274,51 @@ class HTPA:
             ptats[7-block] = bottom_data[0]
 
         pixel_values = np.reshape(pixel_values, (32, 32))
-
         return (pixel_values, ptats)
 
-    def generate_command(self, register, value):
-        return [I2C.Message([register, value])]
+    def expose_block(self, block, blind=False, vdd=False):
+        cmd = 0x09 + (block << 4)
+        cmd = cmd + 0x02 if blind else cmd
+        cmd = cmd + 0x04 if vdd else cmd
 
-    def generate_expose_block_command(self, block, blind=False):
-        if blind:
-            return self.generate_command(0x01, 0x09 + (block << 4) + 0x02)
-        else:
-            return self.generate_command(0x01, 0x09 + (block << 4))
+        self.write_register(REG_CONFIG, cmd)
 
-    def send_command(self, cmd, wait=True):
-        self.i2c.transfer(self.address, cmd)
-        if wait:
-            time.sleep(0.005)  # sleep for 5 ms
+    def query_capture(self):
+        query = [I2C.Message([REG_STATUS]), I2C.Message([0x00], read=True)]
+        self.i2c.transfer(self.address, query)
+        
+        return query[1].data[0]
 
-    def close(self):
-        sleep = self.generate_command(0x01, 0x00)
-        self.send_command(sleep)
+    def block_capture_finished(self, block, blind, vdd):
+        expected = 1 + (block << 4)
+        expected = expected + 0x02 if blind else expected
+        expected = expected + 0x04 if vdd else expected
+
+        ans = self.query_capture()
+
+        return expected == ans
+
+    def eeprom_value_to_float(self, value):
+        return struct.unpack('f', reduce(lambda a,b: a+b, [chr(v) for v in value]))[0]
+
+
+def unsigned_to_signed_array(arr, bits=16):
+    arr = [a - 2**bits if a >= 2**(bits-1) else a for a in arr]
+    return arr
+
+
+if __name__ == "__main__":
+    dev = HTPA(0x1A)
+
+    # should be run periodically. For instance from 10 to 10 seconds.
+    dev.update_compensation_parameters()
+
+    # 32x32 array of object temperatures in celsius
+    # ambient temperature given in decikelvins
+    temperatures, ta = dev.capture_temperatures()
+
+    print("Ambient temperature: {}".format(ta))
+    print("Temperatures: ")
+    print(temperatures)
+
+    dev.close()
